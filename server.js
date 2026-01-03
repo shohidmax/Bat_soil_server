@@ -1,18 +1,15 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
+const { MongoClient, ServerApiVersion } = require('mongodb');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const http = require('http').createServer(app);
 
-// Socket.io Setup
 const io = require('socket.io')(http, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+  cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
 const port = process.env.PORT || 3000;
@@ -26,66 +23,100 @@ app.use(bodyParser.urlencoded({ extended: true }));
 const uri = "mongodb+srv://atifsupermart202199:FGzi4j6kRnYTIyP9@cluster0.bfulggv.mongodb.net/?retryWrites=true&w=majority";
 const client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true, serverApi: ServerApiVersion.v1 });
 
+let pendingCommands = {};
+
 io.on('connection', (socket) => {
   console.log('User connected via Socket.io');
-  socket.on('disconnect', () => console.log('User disconnected'));
 });
 
 async function run() {
   try {
     await client.connect();
-    console.log('DB connected successfully');
+    console.log('DB connected');
     
     const db = client.db('Esp32data4');
     const EspCollection = db.collection('espdata2');
-    const DeviceMetaCollection = db.collection('device_metadata'); // নাম সেভ করার নতুন কালেকশন
+    const DeviceMetaCollection = db.collection('device_metadata');
 
-    // --- 1. Save Device Name API (New) ---
-    app.post('/api/device-name', async (req, res) => {
-      try {
-        const { uid, name } = req.body;
-        if (!uid || !name) return res.status(400).send({ error: "UID and Name required" });
-
-        // নাম আপডেট বা ইনসার্ট করা (Upsert)
-        const result = await DeviceMetaCollection.updateOne(
-          { uid: uid },
-          { $set: { uid: uid, name: name } },
-          { upsert: true }
-        );
-        
-        io.emit('name-updated', { uid, name }); // ক্লায়েন্টদের আপডেট জানানো
-        res.send({ success: true, message: "Name saved" });
-      } catch (err) {
-        console.error("Error saving name:", err);
-        res.status(500).send({ error: "Failed to save name" });
-      }
+    // --- ADMIN ROUTE ---
+    app.get('/admin', (req, res) => {
+        res.sendFile(path.join(__dirname, 'public', 'admin.html'));
     });
 
-    // --- 2. Get Device Names API (New) ---
-    app.get('/api/device-names', async (req, res) => {
+    // --- API: Toggle Device Visibility (Admin) ---
+    app.post('/api/admin/toggle-visibility', async (req, res) => {
+        const { uid, isHidden } = req.body;
+        try {
+            await DeviceMetaCollection.updateOne(
+                { uid }, 
+                { $set: { uid, isHidden: isHidden } }, 
+                { upsert: true }
+            );
+            io.emit('visibility-updated', { uid, isHidden }); // Notify clients
+            res.send({ success: true });
+        } catch (e) { res.status(500).send({ error: "Failed" }); }
+    });
+
+    // --- API: Get Device Metadata (Names & Visibility) ---
+    app.get('/api/device-metadata', async (req, res) => {
       try {
         const docs = await DeviceMetaCollection.find({}).toArray();
-        // Array কে Object Map এ কনভার্ট করা { "uid": "name" }
+        const metaMap = {};
+        docs.forEach(doc => { 
+            metaMap[doc.uid] = { name: doc.name, isHidden: doc.isHidden }; 
+        });
+        res.send(metaMap);
+      } catch (err) { res.status(500).send({ error: "Error fetching metadata" }); }
+    });
+    
+    // Legacy support for name only
+    app.get('/api/device-names', async (req, res) => {
+        const docs = await DeviceMetaCollection.find({}).toArray();
         const nameMap = {};
         docs.forEach(doc => { nameMap[doc.uid] = doc.name; });
         res.send(nameMap);
-      } catch (err) {
-        res.status(500).send({ error: "Failed to fetch names" });
-      }
     });
 
-    // --- 3. Sensor Data API ---
+    // --- API: Save Name ---
+    app.post('/api/device-name', async (req, res) => {
+      try {
+        const { uid, name } = req.body;
+        await DeviceMetaCollection.updateOne({ uid }, { $set: { uid, name } }, { upsert: true });
+        io.emit('name-updated', { uid, name });
+        res.send({ success: true });
+      } catch (err) { res.status(500).send({ error: "Error saving name" }); }
+    });
+
+    // --- Command API ---
+    app.post('/api/send-command', (req, res) => {
+      const { uid, command, value } = req.body;
+      if (!pendingCommands[uid]) pendingCommands[uid] = {};
+
+      if (command === 'restart') pendingCommands[uid].command = 'restart';
+      else if (command === 'setDry') pendingCommands[uid].setDry = parseInt(value);
+      else if (command === 'setWet') pendingCommands[uid].setWet = parseInt(value);
+      else if (command === 'setInterval') pendingCommands[uid].setInterval = parseInt(value);
+
+      console.log(`Command queued for ${uid}`);
+      res.send({ success: true, message: "Command queued" });
+    });
+
+    // --- Sensor Data API ---
     app.post('/api/esp32p', async (req, res) => {
       try {
         const sensorData = req.body;
-        const result = await EspCollection.insertOne(sensorData);
+        const uid = sensorData.uid;
+        
+        await EspCollection.insertOne(sensorData);
         io.emit('new-data', sensorData);
-        console.log("Data received from:", sensorData.uid);
-        res.send(result);
-      } catch (err) {
-        console.error("Error in POST:", err);
-        res.status(500).send("Error saving data");
-      }
+
+        let responsePayload = { status: "success" };
+        if (uid && pendingCommands[uid]) {
+          responsePayload = { ...responsePayload, ...pendingCommands[uid] };
+          delete pendingCommands[uid];
+        }
+        res.json(responsePayload);
+      } catch (err) { res.status(500).send("Server Error"); }
     });
 
     app.get('/api/esp32', async(req, res) =>{
@@ -94,16 +125,24 @@ async function run() {
       res.send(Data);
     });
 
-    app.get("/", (req, res) => {
-      res.send(`<h1 style="color:green;text-align:center;">Server Running on ${port}</h1><a href="/index.html">Go to Dashboard</a>`);
+    // Report API
+    app.get('/api/report', async (req, res) => {
+      try {
+        const { uid, startDate, endDate } = req.query;
+        let query = {};
+        if (uid) query.uid = uid;
+        if (startDate && endDate) {
+            query.dateTime = { $gte: startDate.replace('T', ' ') + ":00", $lte: endDate.replace('T', ' ') + ":59" };
+        }
+        const data = await EspCollection.find(query).sort({ _id: -1 }).toArray();
+        res.send(data);
+      } catch (err) { res.status(500).send({ error: "Failed" }); }
     });
 
-  } finally {
-    // await client.close();
-  }
+    app.get("/", (req, res) => res.send("Server Running v3.0"));
+
+  } finally {}
 }
 run().catch(console.dir);
 
-http.listen(port, () => {
-  console.log("Server running at port : ", port);
-});
+http.listen(port, () => console.log(`Server running on port ${port}`));
